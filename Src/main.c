@@ -21,26 +21,43 @@
 #if !defined(__SOFT_FP__) && defined(__ARM_FP)
   #warning "FPU is not initialized, but the project is compiling for an FPU. Please initialize the FPU before use."
 #endif
-
+#define MAX_TASKS 4
 //some sram calculation
-#define SRAM_START			0x20000000
+#define SRAM_START			0x20000000U
 #define SRAM_SIZE			((1024)*(128))
 #define TASK_SIZE			1024U
-#define SRAM_END    		((SRAM_START)+SRAM_SIZE )
+#define SRAM_END    		((SRAM_START)+(SRAM_SIZE) )
 
 #define TASK1_START			SRAM_END
-#define TASk2_START			((SRAM_END) - (1*TASK_SIZE))
-#define TASk3_START			((SRAM_END) - (2*TASK_SIZE))
-#define TASk4_START			((SRAM_END) - (3*TASK_SIZE))
-#define TASk_SCHEDULER		((SRAM_END) - (4*TASK_SIZE))
+#define TASK2_START			((SRAM_END) - (1*TASK_SIZE))
+#define TASK3_START			((SRAM_END) - (2*TASK_SIZE))
+#define TASK4_START			((SRAM_END) - (3*TASK_SIZE))
+#define IDLE_STACK_START    ((SRAM_END) - (4*TASK_SIZE) )
+#define TASk_SCHEDULER		((SRAM_END) - (5*TASK_SIZE))
 
-#define HSI_CLOCK			16000000U
+#define HSI_CLOCK			16000000U		//0.0625 microseconds
 #define SYSTICK_CLK			HSI_CLOCK
 uint32_t tick_s	 =			1000;
 uint32_t *psrvr  = 			(uint32_t*)0xE000E014;
 uint32_t *pscsr  = 			(uint32_t*)0xE000E010;
+uint8_t current_task = 1;
+
+#define DUMMY_XPSR  0x01000000U
 
 
+typedef struct
+{
+	uint32_t psp_value;
+	uint32_t block_count;
+	uint8_t  current_state;
+	void (*task_handler)(void);
+}TCB_t;
+
+/* Each task has its own TCB */
+TCB_t user_tasks[MAX_TASKS];
+
+//uint32_t task[MAX_TASKS] ={TASK1_START,TASK2_START,TASK3_START,TASK4_START};
+//uint32_t task_handler[MAX_TASKS];
 void task_1(void);
 void task_2(void);
 void task_3(void);
@@ -49,11 +66,35 @@ void task_scheduler(void);
 
 void init_systick_timer(uint32_t tick);
 
+uint32_t user_task[MAX_TASKS];
 
+uint32_t task_handler[MAX_TASKS];
 int main(void)
 {
 
+	enable_processor_faults();
+
+	init_scheduler_stack(TASk_SCHEDULER);
+
+	task_handler[0] = (uint32_t)task_1;
+	task_handler[1] = (uint32_t)task_2;
+	task_handler[2] = (uint32_t)task_3;
+	task_handler[3] = (uint32_t)task_4;
+
+//	user_tasks[0].task_handler = task_1;
+//	user_tasks[1].task_handler = task_2;
+//	user_tasks[2].task_handler = task_3;
+//	user_tasks[3].task_handler = task_4;
+
+
+	init_tasks_stack();
+
 	init_systick_timer(tick_s);
+
+	change_sp_to_psp();
+
+	task_1();
+
     /* Loop forever */
 	for(;;);
 }
@@ -62,7 +103,7 @@ void task_1(void)
 {
 	while(1)
 	{
-		printf("Running task_1");
+		printf("Running task_1 \n");
 	}
 
 }
@@ -71,7 +112,7 @@ void task_2(void)
 {
 	while(1)
 	{
-		printf("Running task_2");
+		printf("Running task_2 \n");
 	}
 
 }
@@ -80,7 +121,7 @@ void task_3(void)
 {
 	while(1)
 	{
-		printf("Running task_3");
+		printf("Running task_3 \n");
 	}
 
 }
@@ -89,7 +130,8 @@ void task_4(void)
 {
 	while(1)
 	{
-		printf("Running task_4");
+		printf("Running task_4 \n");
+
 	}
 
 }
@@ -99,8 +141,57 @@ void task_scheduler(void)
 
 }
 
+
+void save_psp_value(uint32_t current_psp_value)
+{
+	user_tasks[current_task].psp_value = current_psp_value;
+}
+
+void update_current_task(){
+
+	current_task++;
+	current_task %=MAX_TASKS;
+
+}
+
+__attribute ((naked)) void SysTick_Handler(void){
+
+	/* save the context of current task 	 */
+	__asm volatile("PUSH {LR}");
+	//1. Get current running psp value
+	__asm volatile ("MRS R0, PSP");
+	//2.using the PSP value store the SF2(R4 to R11)
+	__asm volatile ("STMDB R0!,{R4-R11}");// stores the r4-r5 register in stack memory of this task
+	//3. save the current value of psp
+	__asm volatile ("BL save_psp_value ");
+
+	/*Retrieve the context of next task  */
+
+	//1. decide the next task to run
+	__asm volatile ("BL update_current_task");
+
+	//2. get the psp value
+	__asm volatile ("BL get_psp_value");
+
+	//3.using psp value retrieve SF2(R4 - R11)
+	__asm volatile(" LDM R0!,{R4-R11}");
+
+	//4. update the PSP and exit
+
+	__asm volatile("MSR PSP, R0");
+
+	__asm volatile ("POP {LR}");
+	__asm volatile("BX LR");
+
+}
+
 void init_systick_timer(uint32_t tick)
 {
+
+	// 16000000  divided by 1000 = 16000,
+	// System runs 0.0625 micro seconds for each pulse signal
+	// here we need the systic timer to run 1 ms
+	// if we programmed the systick reload register to 16000 khz so 0.0625 * 16000 =1 ms
 
 	uint32_t count_value = ((SYSTICK_CLK)/(tick))-1;
 	//Clear the value of reload register upto 24 bits
@@ -109,10 +200,129 @@ void init_systick_timer(uint32_t tick)
 	//set the count value in reload register
 	*psrvr |= count_value;
 
-	*pscsr |= 1<<0; // Enables the counter
+
 	*pscsr |= 1<<1; // Enables SysTick exception request
 	*pscsr |= 1<<2; // Set the processor clock
 
+
+	*pscsr |= 1<<0; // Enables the counter
 }
 
+__attribute__((naked)) void init_scheduler_stack(uint32_t sched_top_of_stack)
+{
+    // __asm volatile("MSR MSP,%0": :  "r" (sched_top_of_stack)  :   );
+	__asm volatile ("MSR MSP, R0");
+     __asm volatile("BX LR");
+
+}
+
+/* this function stores dummy stack contents for each task */
+
+void init_tasks_stack(void)
+{
+
+//	user_tasks[0].current_state = TASK_READY_STATE;
+//	user_tasks[1].current_state = TASK_READY_STATE;
+//	user_tasks[2].current_state = TASK_READY_STATE;
+//	user_tasks[3].current_state = TASK_READY_STATE;
+//	user_tasks[4].current_state = TASK_READY_STATE;
+
+//	user_tasks[0].psp_value = IDLE_STACK_START;
+//	user_tasks[0].psp_value = TASK1_START;
+//	user_tasks[1].psp_value = TASk2_START;
+//	user_tasks[2].psp_value = TASk3_START;
+//	user_tasks[3].psp_value = TASk4_START;
+
+	user_task[0] = TASK1_START;
+	user_task[1] = TASK2_START;
+	user_task[2] = TASK3_START;
+	user_task[3] = TASK4_START;
+
+
+//	user_tasks[0].task_handler = idle_task;
+
+
+	uint32_t *pPSP;
+
+	for(int i = 0 ; i < MAX_TASKS ;i++)
+	{
+		pPSP = 	(uint32_t*) user_task[i];
+
+		pPSP--;
+		*pPSP = DUMMY_XPSR;//0x01000000
+
+		pPSP--; //PC
+		*pPSP = (uint32_t) task_handler[i];
+
+		pPSP--; //LR
+		*pPSP = 0xFFFFFFFD;
+
+		for(int j = 0 ; j < 13 ; j++)
+		{
+			pPSP--;
+		    *pPSP = 0;
+
+		}
+
+		user_tasks[i].psp_value = (uint32_t)pPSP;
+
+
+	}
+
+}
+
+uint32_t  get_psp_value(){
+
+	return user_tasks[current_task].psp_value;
+
+}
+
+ __attribute ((naked))void change_sp_to_psp()
+ {
+
+	__asm volatile ("PUSH {LR}");//preserve which connect back to main();
+	 //initiliaze a psp
+	 // this call make a LR corrupte, first u need to push a lr
+	__asm volatile ("BL get_psp_value");//gets the returned value from the fucntion of get_psp_value,Stores the value into R0.
+	__asm volatile("MSR PSP, R0");
+
+	__asm volatile ("POP {LR}");
+	//change the MSP to PSP, pass a value that enables PSP.
+	__asm volatile("MOV R0,#0x02");
+	__asm volatile("MSR CONTROL,R0");
+	__asm volatile("BX LR");
+
+ }
+
+
+
+
+
+void enable_processor_faults()
+{
+	uint32_t *pSHCSR = (uint32_t*)0xE000ED24;
+
+	*pSHCSR |= ( 1 << 16); //mem manage
+	*pSHCSR |= ( 1 << 17); //bus fault
+	*pSHCSR |= ( 1 << 18); //usage fault
+}
+
+void HardFault_Handler(void)
+{
+	printf("Exception : Hardfault\n");
+	while(1);
+}
+
+
+void MemManage_Handler(void)
+{
+	printf("Exception : MemManage\n");
+	while(1);
+}
+
+void BusFault_Handler(void)
+{
+	printf("Exception : BusFault\n");
+	while(1);
+}
 
